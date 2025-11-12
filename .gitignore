@@ -1,0 +1,24 @@
+# Virtual environment
+.venv/
+venv/
+
+# Python cache
+__pycache__/
+*/__pycache__/
+
+# Environment variables
+.env
+
+# DuckDB database
+data/*.duckdb
+data/*.db
+
+# VS Code
+.vscode/
+
+# Streamlit cache
+.streamlit/
+
+# OS stuff
+Thumbs.db
+.DS_Store

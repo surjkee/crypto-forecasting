@@ -1,0 +1,11 @@
+streamlit
+plotly
+pandas
+numpy
+duckdb
+requests
+pycoingecko
+pydantic-settings
+
+torch
+scikit-learn
