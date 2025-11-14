@@ -7,7 +7,7 @@ PROJECT_ROOT = os.path.abspath(os.path.join(CURRENT_DIR, ".."))
 sys.path.append(PROJECT_ROOT)
 # -------------------------
 
-from typing import Literal
+from typing import Literal, Iterable
 
 import pandas as pd
 
@@ -133,8 +133,42 @@ def fetch_and_store_history(
 
     store_history_df(df)
 
+def fetch_and_store_all_history(
+    coins: Iterable[str] | None = None,
+    vs_currency: str | None = None,
+    days: int | None = None,
+    interval: Literal["hourly", "daily"] | None = None,
+) -> None:
+    """
+    Тягне історію одразу для набору монет (список з Settings.tracked_coins за замовчуванням).
+    """
+    settings = get_settings()
+
+    if coins is None:
+        coins = settings.tracked_coins
+
+    vs_currency = vs_currency or settings.default_vs_currency
+    days = days or settings.history_days_default
+    interval = interval or settings.history_interval  # type: ignore[assignment]
+
+    coins = list(coins)
+    print(
+        f"⬇️ Завантажуємо історію для монет: {', '.join(coins)} "
+        f"({vs_currency}), days={days}, interval={interval}"
+    )
+
+    for coin_id in coins:
+        print(f"\n--- {coin_id} ---")
+        try:
+            fetch_and_store_history(
+                coin_id=coin_id,
+                vs_currency=vs_currency,
+                days=days,
+                interval=interval,  # type: ignore[arg-type]
+            )
+        except Exception as e:
+            print(f"⚠️ Помилка при завантаженні {coin_id}: {e}")
 
 
 if __name__ == "__main__":
-    # Стартовий варіант: BTC за 60 днів, погодинно
-    fetch_and_store_history("bitcoin")
+    fetch_and_store_all_history()

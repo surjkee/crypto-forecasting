@@ -1,6 +1,7 @@
 from pathlib import Path
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from pydantic import Field
+from typing import List
 
 
 # Корінь проєкту: .../Crypto-forecasting
@@ -27,6 +28,18 @@ class Settings(BaseSettings):
     default_vs_currency: str = Field("usd", alias="DEFAULT_VS_CURRENCY")
     history_days_default: int = Field(60, alias="HISTORY_DAYS_DEFAULT")
     history_interval: str = Field("hourly", alias="HISTORY_INTERVAL")
+
+    # 🆕 Список монет, за якими ми тягнемо історію
+    tracked_coins: List[str] = Field(
+        default_factory=lambda: [
+            "bitcoin",
+            "ethereum",
+            "solana",
+            "binancecoin",
+            "ripple",
+        ],
+        alias="TRACKED_COINS",
+    )
 
     model_config = SettingsConfigDict(
         env_file=PROJECT_ROOT / ".env",
