@@ -22,3 +22,6 @@ data/*.db
 # OS stuff
 Thumbs.db
 .DS_Store
+
+# ML artifacts
+models/artifacts/

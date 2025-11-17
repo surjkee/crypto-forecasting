@@ -29,7 +29,7 @@ def naive_constant_forecast(
     ts_future = pd.date_range(
         start=last_ts + pd.Timedelta(hours=1),
         periods=horizon_hours,
-        freq="H",
+        freq="h",
     )
 
     y_pred = np.full(shape=horizon_hours, fill_value=last_price, dtype=float)

@@ -1,13 +1,20 @@
 # ui/tabs/debugging.py
 
+import numpy as np
 import pandas as pd
 import plotly.express as px
 import streamlit as st
+import torch
 
 from config.settings import get_settings
 from data.db import load_ohlcv_hourly
+from features.transform import build_feature_frame
 from models.baseline import naive_constant_forecast
+from models.lstm.inference import load_lstm_checkpoint
+from models.lstm.train import _inverse_scale_target
 from ui.constants import TRACKED_COINS
+
+
 
 
 def render_debugging_tab():
@@ -16,7 +23,7 @@ def render_debugging_tab():
 
     st.title("🛠 Debugging (backtest на 'вчора')")
 
-    # Вибір монети (той самий TRACKED_COINS)
+    # Вибір монети
     labels = [label for label, _ in TRACKED_COINS]
     ids = [cid for _, cid in TRACKED_COINS]
     default_index = ids.index("bitcoin") if "bitcoin" in ids else 0
@@ -32,11 +39,21 @@ def render_debugging_tab():
         )
         selected_coin_id = ids[labels.index(selected_label)]
 
+        model_choice = st.radio(
+            "Модель:",
+            options=["Baseline", "LSTM"],
+            horizontal=True,
+            key="debug_model_choice",
+        )
+
     with col_info:
         st.caption(
-            "Тут ми тестуємо просту baseline-модель (naive constant forecast), "
-            "ніби ми знаходимося у 'вчорашній день', і дивимося, як вона "
-            "прогнозує наступні 24 години."
+            "Тут ми тестуємо моделі на 'вчорашній' добі:\n"
+            "- беремо історію до вчора (anchor),\n"
+            "- для кожної години вчора будуємо прогноз t+1,\n"
+            "- на кожному кроці модель усе одно бачить реальні дані до цього моменту.\n\n"
+            "Це імітація онлайн-режиму: щогодини надходить нова реальна ціна, "
+            "і ми прогнозуємо наступну годину."
         )
 
     # Завантажуємо дані з DuckDB
@@ -54,14 +71,13 @@ def render_debugging_tab():
     df_raw = df_raw.copy()
     df_raw["ts_hour"] = df_raw["ts"].dt.floor("h")
 
-    # Робимо 1 запис на годину (на випадок, якщо є дублікати)
+    # Один запис на годину
     df_hourly = (
         df_raw.sort_values("ts_hour")
         .drop_duplicates(subset=["ts_hour"], keep="last")
         .reset_index(drop=True)
     )
 
-    # Перевіряємо, що даних достатньо
     if len(df_hourly) < 24 * 3:
         st.warning(
             "Замало даних для адекватного backtest'у (потрібно хоча б 3 дні "
@@ -72,10 +88,10 @@ def render_debugging_tab():
     max_hour = df_hourly["ts_hour"].max()
     anchor_hour = max_hour - pd.Timedelta(hours=24)
 
-    # Історія, доступна моделі до 'anchor_hour'
+    # Історія до anchor_hour (включно)
     df_history = df_hourly[df_hourly["ts_hour"] <= anchor_hour].copy()
 
-    # Фактичні ціни на 24 години після 'anchor_hour'
+    # Факт на 24 години після anchor_hour
     df_future_true = df_hourly[
         (df_hourly["ts_hour"] > anchor_hour)
         & (df_hourly["ts_hour"] <= anchor_hour + pd.Timedelta(hours=24))
@@ -88,24 +104,148 @@ def render_debugging_tab():
         )
         return
 
-    # Готуємо історію для baseline-моделі:
-    # ставимо ts = ts_hour, щоб timestamps були чітко погодинні
-    hist_for_model = df_history.sort_values("ts_hour").copy()
-    hist_for_model["ts"] = hist_for_model["ts_hour"]
+    # ---------- BASELINE ВАРІАНТ (як був) ----------
+    if model_choice == "Baseline":
+        hist_for_model = df_history.sort_values("ts_hour").copy()
+        hist_for_model["ts"] = hist_for_model["ts_hour"]
 
-    # Робимо baseline-прогноз на стільки, скільки маємо фактів (звичайно 24)
-    try:
-        df_forecast, _ = naive_constant_forecast(
-            history=hist_for_model,
-            horizon_hours=len(df_future_true),
+        try:
+            df_forecast, _ = naive_constant_forecast(
+                history=hist_for_model,
+                horizon_hours=len(df_future_true),
+            )
+        except Exception as e:
+            st.error(f"Помилка під час побудови baseline-прогнозу: {e}")
+            return
+
+        model_name = "Baseline (naive constant)"
+
+    # ---------- LSTM: teacher forcing 1-step backtest на 'вчора' ----------
+    else:
+        model_name = "LSTM"
+
+        try:
+            # вантажимо модель + scaler + список фіч
+            model, scaler, feature_cols, target_col_idx, cfg = load_lstm_checkpoint(
+                selected_coin_id, vs_currency
+            )
+        except FileNotFoundError:
+            st.error(
+                "Не знайдено збережену LSTM-модель для цієї монети.\n\n"
+                "Спочатку натренуй її командою:\n\n"
+                f"`python -m jobs.train_lstm --coin_id {selected_coin_id}`"
+            )
+            return
+        except Exception as e:
+            st.error(f"Помилка при завантаженні LSTM-моделі: {e}")
+            return
+
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        model.to(device)
+        model.eval()
+
+        # Для фіч: використовуємо ts_hour як еталонний час
+        df_feat_input = df_hourly.copy()
+        df_feat_input["ts"] = df_feat_input["ts_hour"]
+
+        df_feat = build_feature_frame(df_feat_input)
+
+        # df_model: тільки ts + ті фічі, на яких навчалась модель
+        missing = [c for c in feature_cols if c not in df_feat.columns]
+        if missing:
+            st.error(
+                "В поточному фреймі фіч не вистачає колонок, "
+                "на яких навчалась модель:\n\n"
+                + ", ".join(missing)
+            )
+            return
+
+        df_model = df_feat[["ts"] + feature_cols].copy()
+        df_model = df_model.dropna(subset=feature_cols).reset_index(drop=True)
+
+        if len(df_model) <= cfg.window_size + 1:
+            st.error(
+                f"Замало даних для побудови вікон: {len(df_model)} рядків після dropna, "
+                f"потрібно хоча б window_size={cfg.window_size}."
+            )
+            return
+
+        # Масштабуємо всі фічі тим самим scaler'ом, що був на train
+        values = df_model[feature_cols].values.astype(np.float32)
+        scaled_all = scaler.transform(values)
+
+        # Створюємо мапу ts -> індекс у df_model
+        ts_series = df_model["ts"]
+        ts_to_idx = {ts: idx for idx, ts in enumerate(ts_series)}
+
+        # Цільові точки прогнозу: (anchor, anchor + 24h], з кроком 1 година
+        ts_start = anchor_hour + pd.Timedelta(hours=1)   # anchor+1
+        ts_end = anchor_hour + pd.Timedelta(hours=len(df_future_true))
+
+        target_ts_list = []
+        target_indices = []
+
+        for ts in ts_series:
+            if ts_start <= ts <= ts_end:
+                idx = ts_to_idx[ts]
+                if idx >= cfg.window_size:
+                    target_ts_list.append(ts)
+                    target_indices.append(idx)
+
+        if not target_indices:
+            st.error(
+                "Не вдалося знайти достатньо точок для побудови вікон LSTM "
+                "на 'вчорашній' добі. Можливо, замало даних після dropna."
+            )
+            return
+
+        # One-step ahead прогнози з teacher forcing:
+        # для кожного t_pred беремо реальне вікно [t_pred-window_size .. t_pred-1]
+        preds_scaled = []
+
+        with torch.no_grad():
+            for idx in target_indices:
+                window_scaled = scaled_all[idx - cfg.window_size : idx, :]  # (W, F)
+                x = torch.tensor(
+                    window_scaled[None, :, :],
+                    dtype=torch.float32,
+                    device=device,
+                )
+                y_scaled = model(x).cpu().numpy()[0, 0]
+                preds_scaled.append(y_scaled)
+
+        preds_scaled_arr = np.array(preds_scaled, dtype=np.float32)
+
+        # Інверсія масштабу для таргета
+        y_pred = _inverse_scale_target(
+            scaler,
+            feature_cols,
+            target_col_idx,
+            preds_scaled_arr,
         )
-    except Exception as e:
-        st.error(f"Помилка під час побудови прогнозу: {e}")
-        return
+
+        # Реальні ціни (таргет) на ці самі моменти часу
+        y_true = (
+            df_model.loc[target_indices, cfg.target_col]
+            .to_numpy(dtype=float)
+        )
+
+        df_forecast = pd.DataFrame(
+            {
+                "ts": target_ts_list,
+                "y_pred": y_pred,
+            }
+        )
+
+        # Для коректного мерджу з df_future_true працюємо через ts_hour
+        df_forecast["ts_hour"] = df_forecast["ts"].dt.floor("h")
+
+    # ---------- Спільна частина: метрики, графік, таблиця ----------
 
     # Нормалізуємо час у прогнозі та обʼєднуємо по ts_hour
-    df_forecast = df_forecast.copy()
-    df_forecast["ts_hour"] = df_forecast["ts"].dt.floor("h")
+    if model_choice == "Baseline":
+        df_forecast = df_forecast.copy()
+        df_forecast["ts_hour"] = df_forecast["ts"].dt.floor("h")
 
     df_merged = pd.merge(
         df_future_true[["ts_hour", "price"]],
@@ -121,21 +261,21 @@ def render_debugging_tab():
         )
         return
 
-    # Рахуємо метрики
-    y_true = df_merged["price"]
-    y_pred = df_merged["y_pred"]
+    # Метрики
+    y_true_merge = df_merged["price"]
+    y_pred_merge = df_merged["y_pred"]
 
-    mae = (y_true - y_pred).abs().mean()
-    rmse = ((y_true - y_pred) ** 2).mean() ** 0.5
+    mae = (y_true_merge - y_pred_merge).abs().mean()
+    rmse = ((y_true_merge - y_pred_merge) ** 2).mean() ** 0.5
 
-    st.subheader("Метрики якості (baseline на 'вчорашній' добі)")
+    st.subheader(f"Метрики якості ({model_name} на 'вчорашній' добі)")
     st.write(
         f"**MAE:** {mae:.4f} {vs_currency.upper()}  \n"
         f"**RMSE:** {rmse:.4f} {vs_currency.upper()}"
     )
 
-    # Готуємо дані для графіка (тільки погодинні ts_hour)
-    ctx_hours = 24  # скільки годин історії показати перед anchor
+    # Графік
+    ctx_hours = 24
     ts_min_plot = anchor_hour - pd.Timedelta(hours=ctx_hours)
 
     df_plot_hist = df_hourly[
@@ -149,7 +289,7 @@ def render_debugging_tab():
     df_plot_future["ts_plot"] = df_plot_future["ts_hour"]
 
     df_plot_forecast = df_forecast.copy()
-    df_plot_forecast["series"] = "Прогноз (baseline)"
+    df_plot_forecast["series"] = f"Прогноз ({model_name})"
     df_plot_forecast["ts_plot"] = df_plot_forecast["ts_hour"]
     df_plot_forecast = df_plot_forecast.rename(columns={"y_pred": "price"})
 
@@ -169,7 +309,7 @@ def render_debugging_tab():
         ignore_index=True,
     )
 
-    st.subheader("Графік: історія, майбутнє та прогноз (baseline)")
+    st.subheader(f"Графік: історія, майбутнє та прогноз ({model_name})")
 
     fig = px.line(
         df_plot_all,
@@ -192,3 +332,5 @@ def render_debugging_tab():
             width="stretch",
             height=400,
         )
+
+
