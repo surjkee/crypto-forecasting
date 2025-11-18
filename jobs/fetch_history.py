@@ -40,6 +40,7 @@ def market_chart_to_df(
 
     # Конвертуємо мс → datetime (UTC)
     df["ts"] = pd.to_datetime(df["ts_ms"], unit="ms", utc=True)
+    df["ts"] = df["ts"].dt.floor("h")
     df = df.drop(columns=["ts_ms"])
 
     # Додаємо ідентифікатори
@@ -51,6 +52,9 @@ def market_chart_to_df(
 
     # Сортуємо за часом
     df = df.sort_values("ts").reset_index(drop=True)
+
+    # Забираємо дублікати — залишаємо останнє значення (найсвіжіше)
+    df = df.drop_duplicates(subset=["coin_id", "vs_currency", "ts"], keep="last")
 
     return df
 

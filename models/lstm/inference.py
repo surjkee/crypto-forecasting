@@ -7,10 +7,16 @@ import pandas as pd
 import torch
 
 from config.settings import get_settings
+
 from data.db import load_ohlcv_hourly
+from data.db import store_hourly_forecast
+from data.db import ensure_forecast_continuity
+
 from features.transform import build_feature_frame
+
 from models.lstm.config import LSTMConfig
 from models.lstm.model import LSTMForecastModel
+from models.lstm.train import _inverse_scale_target
 
 
 def _to_device():
@@ -114,72 +120,109 @@ def forecast_from_history(
     return df_forecast
 
 
-def forecast_next_horizon(
+def forecast_next_t1_and_store(
     coin_id: str,
     vs_currency: str | None = None,
-    horizon_hours: int = 24,
-) -> pd.DataFrame:
+    model_name: str = "lstm_v0.4",
+):
     """
-    Рекурсивний прогноз на horizon_hours кроків вперед від останньої точки.
-    Поки простий варіант без складного перерахунку фіч — baseline для UI.
+    1) Завантажує останні дані (OHLCV)
+    2) Будує фічі
+    3) Беремо останнє історичне вікно (window_size)
+    4) Проганяємо через LSTM -> отримуємо y_pred(t+1)
+    5) Зберігаємо результат у forecast_hourly
     """
     settings = get_settings()
     vs_currency = vs_currency or settings.default_vs_currency
 
-    model, scaler, feature_cols, target_col_idx, cfg = load_lstm_checkpoint(
-        coin_id, vs_currency
-    )
-    device = _to_device()
-    model.to(device)
+    ensure_forecast_continuity(coin_id, vs_currency, model_name)
 
-    # Беремо останні дані з DuckDB
+    # 1) Завантажуємо сирі дані
     df_raw = load_ohlcv_hourly(coin_id, vs_currency)
     if df_raw.empty:
-        raise RuntimeError("Немає даних для прогнозу.")
+        raise RuntimeError(
+            f"Немає OHLCV для {coin_id} ({vs_currency}). Спершу запусти jobs.fetch_history."
+        )
 
+    # 2) Готуємо фічі
     df_feat = build_feature_frame(df_raw)
-    df_model = df_feat[["ts"] + feature_cols].copy()
+    cfg = LSTMConfig()
 
-    values = df_model[feature_cols].values.astype(np.float32)
+    # Колонки фіч — усі, крім ts
+    feature_cols = [c for c in df_feat.columns if c not in ("ts",)]
+    if cfg.target_col not in feature_cols:
+        raise RuntimeError("В df_feat немає 'price' як таргета!")
+
+    df_model = df_feat[["ts"] + feature_cols].dropna(subset=feature_cols).reset_index(drop=True)
+    if df_model.empty:
+        raise RuntimeError("Після dropna df_model порожній.")
+
+    # 3) Завантажуємо модель + scaler + параметри
+    try:
+        model, scaler, trained_feature_cols, target_col_idx, cfg_loaded = load_lstm_checkpoint(
+            coin_id, vs_currency
+        )
+    except Exception as e:
+        raise RuntimeError(f"Не вдалося завантажити LSTM-модель: {e}")
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model.to(device)
+    model.eval()
+
+    # Перевіряємо фічі (в тренованій моделі порядок може бути іншим)
+    missing = [c for c in trained_feature_cols if c not in df_model.columns]
+    if missing:
+        raise RuntimeError(
+            "У df_model не вистачає фіч, на яких тренувалась модель:\n" + ", ".join(missing)
+        )
+
+    # Перебудовуємо df_model відповідно до порядку фіч моделі
+    df_model = df_model[["ts"] + trained_feature_cols]
+
+    # Масштабуємо всі фічі (але без fit!)
+    values = df_model[trained_feature_cols].values.astype(np.float32)
     scaled = scaler.transform(values)
 
-    if len(scaled) < cfg.window_size:
-        raise RuntimeError("Замало даних для побудови вікна заданого розміру.")
+    # 4) Витягуємо останнє вікно
+    if len(df_model) < cfg.window_size:
+        raise RuntimeError(
+            f"Замало даних: {len(df_model)} рядків, потрібно {cfg.window_size}."
+        )
 
-    window = scaled[-cfg.window_size :, :]  # (window_size, num_features)
+    window_scaled = scaled[-cfg.window_size :, :]  # (W, F)
+    x = torch.tensor(window_scaled[None, :, :], dtype=torch.float32, device=device)
 
-    last_ts = df_model["ts"].max()
-
-    preds_scaled = []
-    ts_future = []
-
+    # Прогноз (в scaled-space)
     with torch.no_grad():
-        for step in range(horizon_hours):
-            x = torch.tensor(window[None, :, :], dtype=torch.float32, device=device)
-            y_scaled = model(x).cpu().numpy()[0, 0]  # scalar
+        y_scaled = model(x).cpu().numpy()[0, 0]
 
-            preds_scaled.append(y_scaled)
+    # 5) Інверсія масштабу
+    y_pred = _inverse_scale_target(
+        scaler,
+        trained_feature_cols,
+        target_col_idx,
+        np.array([y_scaled]),
+    )[0]
 
-            # оновлюємо вікно: зсуваємо і вставляємо новий "рядок"
-            # тут ми вставляємо тільки таргет у свою колонку, решту 0 (бо поки не рахуємо фічі)
-            new_row = np.zeros((window.shape[1],), dtype=np.float32)
-            new_row[target_col_idx] = y_scaled
+    # Часові мітки
+    ts_anchor = df_model["ts"].max()
+    ts_forecast = ts_anchor + timedelta(hours=1)
 
-            window = np.vstack([window[1:], new_row])
-
-            ts_future.append(last_ts + timedelta(hours=step + 1))
-
-    preds_scaled_arr = np.array(preds_scaled, dtype=np.float32)
-
-    # інверсія масштабу лише для ціни
-    from models.lstm.train import _inverse_scale_target  # невеликий reuse
-
-    y_pred = _inverse_scale_target(scaler, feature_cols, target_col_idx, preds_scaled_arr)
-
-    df_forecast = pd.DataFrame(
-        {
-            "ts": ts_future,
-            "y_pred": y_pred,
-        }
+    # 6) Зберігаємо в БД
+    store_hourly_forecast(
+        coin_id=coin_id,
+        vs_currency=vs_currency,
+        ts_anchor=ts_anchor,
+        ts_forecast=ts_forecast,
+        model=model_name,
+        y_pred=float(y_pred),
+        is_backfilled=False,
     )
-    return df_forecast
+
+    return {
+        "coin_id": coin_id,
+        "vs_currency": vs_currency,
+        "ts_anchor": ts_anchor,
+        "ts_forecast": ts_forecast,
+        "y_pred": y_pred,
+    }

@@ -16,6 +16,7 @@ from models.baseline import naive_constant_forecast
 
 from ui.tabs.debugging_tab import render_debugging_tab
 from ui.tabs.data_tab import render_data_tab
+from ui.tabs.forecast_tab import render_forecast_tab
 from ui.tabs.features_tab import render_features_tab
 
 from config.settings import get_settings
@@ -29,16 +30,18 @@ st.set_page_config(
 )
 
 def main():
-    tab_labels = ["Data", "Features", "Debugging"]
-    tabs = st.tabs(tab_labels)
+    tab_data, tab_features, tab_forecast, tab_debug = st.tabs(["📊 Data", "🧩 Features", "🔮 Forecast", "🛠 Debugging"])
 
-    with tabs[0]:
+    with tab_data:
         render_data_tab()
 
-    with tabs[1]:
+    with tab_features:
         render_features_tab()
 
-    with tabs[2]:
+    with tab_forecast:
+        render_forecast_tab()
+
+    with tab_debug:
         render_debugging_tab()
 
 
