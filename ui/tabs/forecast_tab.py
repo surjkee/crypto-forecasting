@@ -5,9 +5,13 @@ import streamlit as st
 from config.settings import get_settings
 from data.db import load_ohlcv_hourly, load_hourly_forecasts
 from ui.constants import TRACKED_COINS
+from streamlit_autorefresh import st_autorefresh
 
 
 def render_forecast_tab():
+    # автооновлення кожну хвилину
+    st_autorefresh(interval=60 * 1000, key="forecast_refresh")
+    
     settings = get_settings()
     vs_currency = settings.default_vs_currency
 
