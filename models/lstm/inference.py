@@ -123,7 +123,7 @@ def forecast_from_history(
 def forecast_next_t1_and_store(
     coin_id: str,
     vs_currency: str | None = None,
-    model_name: str = "lstm_v0.4",
+    model_name: str = "lstm_v1.0",
 ):
     """
     1) Завантажує останні дані (OHLCV)

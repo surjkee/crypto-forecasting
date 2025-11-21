@@ -1,5 +1,3 @@
-# models/lstm/train.py
-
 from pathlib import Path
 from typing import Dict, Any
 
@@ -7,13 +5,13 @@ import numpy as np
 import torch
 from torch import nn
 from torch.utils.data import DataLoader
+from torch.optim.lr_scheduler import ReduceLROnPlateau  # 🔹 новий імпорт
 
 from config.settings import get_settings
 from data.db import load_ohlcv_hourly
 from models.lstm.config import LSTMConfig
 from models.lstm.dataset import prepare_datasets_and_scaler
 from models.lstm.model import LSTMForecastModel
-
 
 
 def _to_device():
@@ -151,16 +149,56 @@ def train_lstm_for_coin(
     criterion = nn.MSELoss()
     optimizer = torch.optim.Adam(model.parameters(), lr=cfg.learning_rate)
 
+    # 🔽 Шедулер для зменшення lr, коли val_loss виходить на плато
+    scheduler = ReduceLROnPlateau(
+        optimizer,
+        mode="min",
+        factor=getattr(cfg, "lr_reduce_factor", 0.5),
+        patience=getattr(cfg, "lr_reduce_patience", 5),
+        min_lr=getattr(cfg, "lr_min", 1e-5),
+    )
+
+    best_val_loss = float("inf")
+    best_state_dict = None
+    no_improve_epochs = 0
+    early_patience = getattr(cfg, "early_stopping_patience", 15)
+    early_min_delta = getattr(cfg, "early_stopping_min_delta", 1e-4)
+
     # --- Тренування ---
     print("🚂 Починаємо тренування LSTM...")
     for epoch in range(1, cfg.num_epochs + 1):
         train_loss = _train_one_epoch(model, train_loader, criterion, optimizer, device)
         val_loss = _evaluate(model, test_loader, criterion, device)
 
+        # оновлюємо lr відносно val_loss
+        scheduler.step(val_loss)
+
         print(
             f"[Epoch {epoch:03d}/{cfg.num_epochs}] "
             f"train_loss={train_loss:.6f}, val_loss={val_loss:.6f}"
         )
+
+        # --- EarlyStopping логіка ---
+        if val_loss + early_min_delta < best_val_loss:
+            best_val_loss = val_loss
+            best_state_dict = model.state_dict()
+            no_improve_epochs = 0
+        else:
+            no_improve_epochs += 1
+
+        if no_improve_epochs >= early_patience:
+            print(
+                f"⛔ EarlyStopping: не було покращення val_loss "
+                f"{no_improve_epochs} епох поспіль. Зупиняємося на епосі {epoch}."
+            )
+            break
+
+    # Після циклу — відкатитися до найкращої версії моделі
+    if best_state_dict is not None:
+        model.load_state_dict(best_state_dict)
+        print(f"✅ Відновлено ваги з найкращим val_loss={best_val_loss:.6f}")
+    else:
+        print("⚠️ best_state_dict порожній — зберігаємо модель з останньої епохи.")
 
     # --- Оцінка на тесті в оригінальному масштабі ---
     print("📏 Оцінюємо модель на тесті...")

@@ -56,7 +56,7 @@ def render_forecast_tab():
         selected_coin_id,
         vs_currency,
         limit=200,
-        model="lstm_v0.4",
+        model="lstm_v1.0",
     )
 
     if df_fc.empty:

@@ -12,7 +12,7 @@ def get_connection(read_only: bool = False) -> duckdb.DuckDBPyConnection:
     """
     Повертає підключення до DuckDB.
     """
-    return duckdb.connect(str(DUCKDB_PATH), read_only=read_only)
+    return duckdb.connect(str(DUCKDB_PATH))
 
 
 def init_db() -> None:
