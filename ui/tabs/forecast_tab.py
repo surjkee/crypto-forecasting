@@ -59,6 +59,14 @@ def render_forecast_tab():
         model="lstm_v1.0",
     )
 
+    df_fc_gru = load_hourly_forecasts(
+        selected_coin_id,
+        vs_currency,
+        limit=200,
+        model="gru_v1.0",
+    )
+
+
     if df_fc.empty:
         st.warning(
             "У таблиці forecast_hourly немає прогнозів для цієї монети.\n\n"
@@ -100,9 +108,18 @@ def render_forecast_tab():
             f"({delta_pct:+.2f}%)"
         )
 
-    st.markdown("---")
+    if not df_fc_gru.empty:
+        last_gru = df_fc_gru.iloc[-1]
+        y_pred_gru = float(last_gru["y_pred"])
+        ts_forecast_gru = last_gru["ts_forecast"]
 
-    # --- Графік: фактична ціна + прогнози ---
+        st.subheader("Останній прогноз t+1 (GRU)")
+        st.write(f"**ts_forecast (t+1):** {ts_forecast_gru}")
+        st.write(f"**Прогноз:** {y_pred_gru:,.2f} {vs_currency.upper()}")
+
+        st.markdown("---")
+
+    # --- Графік: фактична ціна + прогнози t+1 ---
     st.subheader("Графік: факт та прогнози t+1")
 
     # беремо фактичні дані за останні 72 години
@@ -114,24 +131,31 @@ def render_forecast_tab():
     df_price_plot["series"] = "Факт"
     df_price_plot["ts_plot"] = df_price_plot["ts"]
 
-    # фільтруємо прогнози у тому ж вікні (або ширше, якщо хочеш)
+    df_plot_all = df_price_plot[["ts_plot", "price", "series"]].copy()
+
+    # LSTM
     df_fc_plot = df_fc[df_fc["ts_forecast"] >= ts_min].copy()
     if not df_fc_plot.empty:
-        df_fc_plot = df_fc_plot.copy()
-        df_fc_plot["series"] = "Прогноз t+1"
+        df_fc_plot["series"] = "LSTM"
         df_fc_plot["ts_plot"] = df_fc_plot["ts_forecast"]
         df_fc_plot = df_fc_plot.rename(columns={"y_pred": "price"})
-
         df_plot_all = pd.concat(
-            [
-                df_fc_plot[["ts_plot", "price", "series"]],
-                df_price_plot[["ts_plot", "price", "series"]],
-            ],
+            [df_fc_plot[["ts_plot", "price", "series"]], df_plot_all],
             ignore_index=True,
         )
-    else:
-        df_plot_all = df_price_plot[["ts_plot", "price", "series"]]
 
+    # GRU
+    df_fc_gru_plot = df_fc_gru[df_fc_gru["ts_forecast"] >= ts_min].copy()
+    if not df_fc_gru_plot.empty:
+        df_fc_gru_plot["series"] = "GRU"
+        df_fc_gru_plot["ts_plot"] = df_fc_gru_plot["ts_forecast"]
+        df_fc_gru_plot = df_fc_gru_plot.rename(columns={"y_pred": "price"})
+        df_plot_all = pd.concat(
+            [df_fc_gru_plot[["ts_plot", "price", "series"]], df_plot_all],
+            ignore_index=True,
+        )
+
+    # Малюємо
     fig = px.line(
         df_plot_all,
         x="ts_plot",
@@ -147,10 +171,21 @@ def render_forecast_tab():
 
     st.plotly_chart(fig, width="stretch")
 
+
     # --- Таблиця прогнозів ---
-    with st.expander("Показати таблицю останніх прогнозів"):
+    with st.expander("Показати таблицю останніх прогнозів LSTM"):
         st.dataframe(
             df_fc.sort_values("ts_forecast", ascending=False),
             width="stretch",
             height=400,
         )
+    with st.expander("Показати таблицю останніх прогнозів GRU"):
+        if df_fc_gru.empty:
+            st.info("Немає GRU-прогнозів для цієї монети")
+        else:
+            st.dataframe(
+                df_fc_gru.sort_values("ts_forecast", ascending=False),
+                width="stretch",
+                height=400,
+            )
+

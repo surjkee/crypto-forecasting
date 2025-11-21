@@ -9,9 +9,14 @@ import torch
 from config.settings import get_settings
 from data.db import load_ohlcv_hourly
 from features.transform import build_feature_frame
+
 from models.baseline import naive_constant_forecast
 from models.lstm.inference import load_lstm_checkpoint
 from models.lstm.train import _inverse_scale_target
+from models.gru.inference import load_gru_checkpoint
+from models.gru.config import GRUConfig
+
+
 from ui.constants import TRACKED_COINS
 
 
@@ -41,7 +46,7 @@ def render_debugging_tab():
 
         model_choice = st.radio(
             "Модель:",
-            options=["Baseline", "LSTM"],
+            options=["Baseline", "LSTM", "GRU"],
             horizontal=True,
             key="debug_model_choice",
         )
@@ -121,9 +126,7 @@ def render_debugging_tab():
         model_name = "Baseline (naive constant)"
 
     # ---------- LSTM: teacher forcing 1-step backtest на 'вчора' ----------
-    else:
-        model_name = "LSTM"
-
+    elif model_choice == "LSTM":
         try:
             # вантажимо модель + scaler + список фіч
             model, scaler, feature_cols, target_col_idx, cfg = load_lstm_checkpoint(
@@ -239,6 +242,89 @@ def render_debugging_tab():
 
         # Для коректного мерджу з df_future_true працюємо через ts_hour
         df_forecast["ts_hour"] = df_forecast["ts"].dt.floor("h")
+
+        model_name = "LSTM"
+
+    # ---------- GRU: teacher forcing 1-step backtest ----------
+    elif model_choice == "GRU":
+        try:
+            model, scaler, feature_cols, target_col_idx, cfg = load_gru_checkpoint(
+                selected_coin_id, vs_currency
+            )
+        except FileNotFoundError:
+            st.error(
+                "Не знайдено збережену GRU-модель для цієї монети.\n\n"
+                "Спочатку натренуй її командою:\n\n"
+                f"`python -m jobs.train_gru --coin_id {selected_coin_id}`"
+            )
+            return
+        except Exception as e:
+            st.error(f"Помилка при завантаженні GRU-моделі: {e}")
+            return
+
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        model.to(device)
+        model.eval()
+
+        df_feat_input = df_hourly.copy()
+        df_feat_input["ts"] = df_feat_input["ts_hour"]
+        df_feat = build_feature_frame(df_feat_input)
+
+        missing = [c for c in feature_cols if c not in df_feat.columns]
+        if missing:
+            st.error(
+                "В поточному фреймі фіч не вистачає колонок, "
+                "на яких навчалась GRU:\n\n" + ", ".join(missing)
+            )
+            return
+
+        df_model = df_feat[["ts"] + feature_cols].dropna().reset_index(drop=True)
+
+        values = df_model[feature_cols].values.astype(np.float32)
+        scaled_all = scaler.transform(values)
+
+        ts_series = df_model["ts"]
+        ts_to_idx = {ts: idx for idx, ts in enumerate(ts_series)}
+
+        ts_start = anchor_hour + pd.Timedelta(hours=1)
+        ts_end = anchor_hour + pd.Timedelta(hours=len(df_future_true))
+
+        target_ts_list = []
+        target_indices = []
+
+        for ts in ts_series:
+            if ts_start <= ts <= ts_end:
+                idx = ts_to_idx[ts]
+                if idx >= cfg.window_size:
+                    target_ts_list.append(ts)
+                    target_indices.append(idx)
+
+        preds_scaled = []
+
+        with torch.no_grad():
+            for idx in target_indices:
+                window_scaled = scaled_all[idx - cfg.window_size : idx, :]
+                x = torch.tensor(
+                    window_scaled[None, :, :], dtype=torch.float32, device=device
+                )
+                y_scaled = model(x).cpu().numpy()[0, 0]
+                preds_scaled.append(y_scaled)
+
+        preds_scaled_arr = np.array(preds_scaled, dtype=np.float32)
+
+        y_pred = _inverse_scale_target(
+            scaler, feature_cols, target_col_idx, preds_scaled_arr
+        )
+
+        y_true = df_model.loc[target_indices, cfg.target_col].to_numpy(float)
+
+        df_forecast = pd.DataFrame(
+            {"ts": target_ts_list, "y_pred": y_pred}
+        )
+        df_forecast["ts_hour"] = df_forecast["ts"].dt.floor("h")
+
+        model_name = "GRU"
+
 
     # ---------- Спільна частина: метрики, графік, таблиця ----------
 
