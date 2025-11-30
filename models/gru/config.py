@@ -30,7 +30,7 @@ class GRUConfig:
     lr_reduce_patience: int = 15
     lr_min: float = 1e-6
 
-    def get_artifact_path(self, coin_id: str, vs_currency: str) -> Path:
+    def artifact_path(self, coin_id: str, vs_currency: str) -> Path:
         """
         Шлях до файлу з вагами GRU-моделі.
         Аналогічно до LSTM, але з префіксом 'gru_'.

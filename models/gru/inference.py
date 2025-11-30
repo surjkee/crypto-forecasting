@@ -33,7 +33,7 @@ def load_gru_checkpoint(
     device = device or torch.device("cpu")
 
     cfg = GRUConfig()
-    artifact_path: Path = cfg.get_artifact_path(coin_id, vs_currency)
+    artifact_path: Path = cfg.artifact_path(coin_id, vs_currency)
 
     checkpoint = torch.load(artifact_path, map_location=device, weights_only=False)
 
@@ -150,7 +150,7 @@ def forecast_next_t1_and_store(
     ).to(device)
 
     # припускаю, що в GRUConfig є такий самий метод, як у LSTMConfig
-    artifact_path = cfg.get_artifact_path(coin_id, vs_currency)
+    artifact_path = cfg.artifact_path(coin_id, vs_currency)
 
     state = torch.load(artifact_path, map_location=device, weights_only=False)
 
