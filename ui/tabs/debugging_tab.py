@@ -26,40 +26,41 @@ def render_debugging_tab():
     settings = get_settings()
     vs_currency = settings.default_vs_currency
 
-    st.title("🛠 Debugging (backtest на 'вчора')")
+    st.markdown("""
+<style>
+        /* Remove blank space at top and bottom */ 
+        .block-container {
+            padding-top: 0rem;
+            padding-bottom: 0rem;
+        }
+</style>
+""", unsafe_allow_html=True)
 
-    # Вибір монети
+    st.markdown(
+    """
+    <h1 style="text-align: center; margin-top: 0;">
+        🛠 Debugging
+    </h1>
+    """,
+    unsafe_allow_html=True
+)
+    # Використовуємо глобально обрану монету + локальний вибір моделі
     labels = [label for label, _ in TRACKED_COINS]
     ids = [cid for _, cid in TRACKED_COINS]
     default_index = ids.index("bitcoin") if "bitcoin" in ids else 0
+    default_label = labels[default_index]
+    default_id = ids[default_index]
 
-    col_sel, col_info = st.columns([2, 3])
+    selected_coin_id = st.session_state.get("selected_coin_id", default_id)
+    selected_label = st.session_state.get("selected_coin_label", default_label)
 
-    with col_sel:
-        selected_label = st.selectbox(
-            "Оберіть монету:",
-            options=labels,
-            index=default_index,
-            key="debug_coin_select",
-        )
-        selected_coin_id = ids[labels.index(selected_label)]
 
-        model_choice = st.radio(
-            "Модель:",
-            options=["Baseline", "LSTM", "GRU"],
-            horizontal=True,
-            key="debug_model_choice",
-        )
-
-    with col_info:
-        st.caption(
-            "Тут ми тестуємо моделі на 'вчорашній' добі:\n"
-            "- беремо історію до вчора (anchor),\n"
-            "- для кожної години вчора будуємо прогноз t+1,\n"
-            "- на кожному кроці модель усе одно бачить реальні дані до цього моменту.\n\n"
-            "Це імітація онлайн-режиму: щогодини надходить нова реальна ціна, "
-            "і ми прогнозуємо наступну годину."
-        )
+    model_choice = st.radio(
+        "Модель:",
+        options=["Baseline", "LSTM", "GRU"],
+        horizontal=True,
+        key="debug_model_choice",
+    )
 
     # Завантажуємо дані з DuckDB
     df_raw = load_ohlcv_hourly(selected_coin_id, vs_currency)
@@ -354,7 +355,7 @@ def render_debugging_tab():
     mae = (y_true_merge - y_pred_merge).abs().mean()
     rmse = ((y_true_merge - y_pred_merge) ** 2).mean() ** 0.5
 
-    st.subheader(f"Метрики якості ({model_name} на 'вчорашній' добі)")
+    st.subheader(f"Metrics for {model_name} on {selected_label}")
     st.write(
         f"**MAE:** {mae:.4f} {vs_currency.upper()}  \n"
         f"**RMSE:** {rmse:.4f} {vs_currency.upper()}"
@@ -367,15 +368,15 @@ def render_debugging_tab():
     df_plot_hist = df_hourly[
         (df_hourly["ts_hour"] >= ts_min_plot) & (df_hourly["ts_hour"] <= anchor_hour)
     ].copy()
-    df_plot_hist["series"] = "Історія (факт)"
+    df_plot_hist["series"] = "History (Real)"
     df_plot_hist["ts_plot"] = df_plot_hist["ts_hour"]
 
     df_plot_future = df_future_true.copy()
-    df_plot_future["series"] = "Майбутнє (факт)"
+    df_plot_future["series"] = "Future (Real)"
     df_plot_future["ts_plot"] = df_plot_future["ts_hour"]
 
     df_plot_forecast = df_forecast.copy()
-    df_plot_forecast["series"] = f"Прогноз ({model_name})"
+    df_plot_forecast["series"] = f"Forecast ({model_name})"
     df_plot_forecast["ts_plot"] = df_plot_forecast["ts_hour"]
     df_plot_forecast = df_plot_forecast.rename(columns={"y_pred": "price"})
 
@@ -395,7 +396,7 @@ def render_debugging_tab():
         ignore_index=True,
     )
 
-    st.subheader(f"Графік: історія, майбутнє та прогноз ({model_name})")
+    st.subheader(f"History and yesterday's forecast ({model_name})")
 
     fig = px.line(
         df_plot_all,
@@ -403,16 +404,16 @@ def render_debugging_tab():
         y="price",
         color="series",
         labels={
-            "ts_plot": "Час (погодинно)",
-            "price": f"Ціна ({vs_currency.upper()})",
-            "series": "Серія",
+            "ts_plot": "Time",
+            "price": f"Price ({vs_currency.upper()})",
+            "series": "Series",
         },
     )
     fig.update_layout(height=500)
 
     st.plotly_chart(fig, width="stretch")
 
-    with st.expander("Таблиця фактичних та прогнозованих значень (24 години після 'вчора')"):
+    with st.expander("Yesterday's forecast table"):
         st.dataframe(
             df_merged.sort_values("ts_hour"),
             width="stretch",

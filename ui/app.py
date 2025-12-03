@@ -8,43 +8,55 @@ sys.path.append(PROJECT_ROOT)
 # -------------------------
 
 import streamlit as st
-import plotly.express as px
-import pandas as pd
 
-from features.transform import build_feature_frame
-from models.baseline import naive_constant_forecast
-
+from ui.components.sidebar import render_sidebar
 from ui.tabs.debugging_tab import render_debugging_tab
 from ui.tabs.data_tab import render_data_tab
 from ui.tabs.forecast_tab import render_forecast_tab
 from ui.tabs.features_tab import render_features_tab
+from ui.components.footer import render_footer
 
-from config.settings import get_settings
-from data.db import load_ohlcv_hourly
-from jobs.fetch_history import fetch_and_store_history
-
-# --- Загальні налаштування сторінки ---
-st.set_page_config(
-    page_title="Crypto Forecasting - Data",
-    layout="wide",
-)
 
 def main():
-    tab_data, tab_features, tab_forecast, tab_debug = st.tabs(["📊 Data", "🧩 Features", "🔮 Forecast", "🛠 Debugging"])
+    # --- Загальні налаштування сторінки ---
+    st.set_page_config(
+        page_title="Crypto Forecasting - Data",
+        layout="wide",
+    )
+    if not st.session_state.get("developer_mode", True):
+        st.markdown(
+            """
+            <style>
+            [data-testid="stToolbar"] { display: none !important; }
+            </style>
+            """,
+            unsafe_allow_html=True,
+        )
+    st.markdown(
+        """
+    <style>
+        .stAppHeader { 
+            background: rgba(14, 12, 23, 0.0) !important;  /* темне скло */
+        }
+    </style>
+    """,
+        unsafe_allow_html=True,
+    )
+    # Глобальний сайдбар (монета + час + автооновлення)
+    render_sidebar()
+    
+    active_tab = st.session_state.get("active_tab", "data")
 
-    with tab_data:
+    if active_tab == "data":
         render_data_tab()
-
-    with tab_features:
+    elif active_tab == "features":
         render_features_tab()
-
-    with tab_forecast:
+    elif active_tab == "forecast":
         render_forecast_tab()
-
-    with tab_debug:
+    elif active_tab == "debug":
         render_debugging_tab()
 
-
+    render_footer()
 
 if __name__ == "__main__":
     main()
