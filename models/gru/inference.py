@@ -20,31 +20,41 @@ def load_gru_checkpoint(
     coin_id: str,
     vs_currency: str,
     device: torch.device | None = None,
-):
+) -> Tuple[GRUForecastModel, MinMaxScaler, list[str], int, GRUConfig]:
     """
     Завантажує збережену GRU-модель + scaler + фічі з чекпоінта.
+
     Повертає:
-    - model (на потрібному device)
-    - scaler
-    - feature_cols (list[str])
-    - target_col_idx (int)
-    - cfg (GRUConfig)
+        model          – GRUForecastModel на потрібному device
+        scaler         – MinMaxScaler, на якому модель навчалась
+        feature_cols   – порядок і список фіч, як у тренуванні
+        target_col_idx – індекс таргету всередині feature_cols
+        cfg            – GRUConfig, збережений у чекпоінті (якщо був)
     """
     device = device or torch.device("cpu")
 
+    # Базовий конфіг тільки для побудови шляху до артефакту
     cfg = GRUConfig()
     artifact_path: Path = cfg.artifact_path(coin_id, vs_currency)
 
+    if not artifact_path.exists():
+        raise FileNotFoundError(
+            f"Не знайдено GRU-артефакт для {coin_id} ({vs_currency}): {artifact_path}"
+        )
+
     checkpoint = torch.load(artifact_path, map_location=device, weights_only=False)
 
-    # Витягуємо конфіг, якщо він є в чекпоінті
-    cfg_dict = checkpoint.get("config", {})
+    # Якщо в чекпоінті збережений повний config – підміняємо ним дефолтний
+    cfg_dict = checkpoint.get("config")
     if cfg_dict:
         cfg = GRUConfig(**cfg_dict)
 
-    feature_cols = checkpoint["feature_cols"]
-    target_col_idx = int(checkpoint["target_col_idx"])
-    scaler = checkpoint["scaler"]
+    feature_cols: list[str] = checkpoint["feature_cols"]
+    target_col_idx: int = int(checkpoint["target_col_idx"])
+    scaler: MinMaxScaler = checkpoint["scaler"]
+
+    # Витягуємо state_dict (підтримуємо варіант, коли збережено «голий» state_dict)
+    state = checkpoint.get("state_dict", checkpoint)
 
     model = GRUForecastModel(
         input_size=len(feature_cols),
@@ -53,10 +63,11 @@ def load_gru_checkpoint(
         dropout=cfg.dropout,
     ).to(device)
 
-    model.load_state_dict(checkpoint["state_dict"])
+    model.load_state_dict(state)
     model.eval()
 
     return model, scaler, feature_cols, target_col_idx, cfg
+
 
 def _inverse_scale_target(
     scaler: MinMaxScaler,
@@ -85,15 +96,17 @@ def forecast_next_t1_and_store(
 
     1) тягнемо останні OHLCV з DuckDB
     2) рахуємо фічі як у train_gru
-    3) будуємо останнє history-вікно, ганяємо через GRU
-    4) inverse-scale і запис у forecast_hourly з model = model_name
+    3) вантажимо GRU + scaler + feature_cols з чекпоінта
+    4) масштабуємо дані тим самим scaler'ом, що й на train
+    5) робимо прогноз, inverse-scale тільки таргет, пишемо у forecast_hourly
     """
     settings = get_settings()
     vs_currency = vs_currency or settings.default_vs_currency
 
+    # Гарантуємо безперервність ряду прогнозів (як і раніше)
     ensure_forecast_continuity(coin_id, vs_currency, model_name)
 
-    # 1. Сирі дані
+    # 1. Сирі дані з DuckDB
     df_raw = load_ohlcv_hourly(coin_id, vs_currency)
     if df_raw.empty:
         raise RuntimeError(
@@ -103,25 +116,22 @@ def forecast_next_t1_and_store(
 
     # 2. Фічі як у тренуванні
     df_feat = build_feature_frame(df_raw)
-    cfg = GRUConfig()
 
-    # беремо тільки числові колонки (price, volume, sma, volatility, returns, etc.)
-    num_cols = df_feat.select_dtypes(include=["number"]).columns.tolist()
-    # ts нам для моделі не потрібен як фіча
-    feature_cols = [c for c in num_cols if c != "ts"]
+    # 3. Завантажуємо модель + scaler + feature_cols із чекпоінта
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model, scaler, feature_cols, target_col_idx, cfg = load_gru_checkpoint(
+        coin_id=coin_id,
+        vs_currency=vs_currency,
+        device=device,
+    )
 
-    if cfg.target_col not in feature_cols:
-        raise RuntimeError(
-            f"У build_feature_frame немає числової колонки '{cfg.target_col}' як таргета."
-        )
-
-    target_col_idx = feature_cols.index(cfg.target_col)
-
+    # Формуємо датафрейм у тому ж порядку колонок, що й при тренуванні
     df_model = (
         df_feat[["ts"] + feature_cols]
         .dropna(subset=feature_cols)
         .reset_index(drop=True)
     )
+
     if len(df_model) <= cfg.window_size:
         raise RuntimeError(
             f"Замало даних для прогнозу: {len(df_model)} рядків, "
@@ -131,43 +141,19 @@ def forecast_next_t1_and_store(
     ts_anchor = df_model["ts"].max()
     ts_forecast = ts_anchor + timedelta(hours=1)
 
-    # 3. Скейлінг по всій історії (як у LSTM-інференсі)
+    # 4. Скейлінг ТИМ САМИМ scaler'ом, що був на тренуванні (transform, НЕ fit_transform)
     values = df_model[feature_cols].values.astype(np.float32)
-    scaler = MinMaxScaler()
-    values_scaled = scaler.fit_transform(values)
+    values_scaled = scaler.transform(values)
 
-    window = values_scaled[-cfg.window_size :]  # (window, n_features)
-    x = torch.from_numpy(window).unsqueeze(0)   # (1, window, n_features)
+    # Беремо останнє вікно для t+1
+    window = values_scaled[-cfg.window_size :]   # (window, n_features)
+    x = torch.from_numpy(window).unsqueeze(0).to(device)  # (1, window, n_features)
 
-    # 4. Завантажуємо модель GRU
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-    model = GRUForecastModel(
-        input_size=len(feature_cols),
-        hidden_size=cfg.hidden_size,
-        num_layers=cfg.num_layers,
-        dropout=cfg.dropout,
-    ).to(device)
-
-    # припускаю, що в GRUConfig є такий самий метод, як у LSTMConfig
-    artifact_path = cfg.artifact_path(coin_id, vs_currency)
-
-    state = torch.load(artifact_path, map_location=device, weights_only=False)
-
-    if isinstance(state, dict) and "state_dict" in state:
-        state_dict = state["state_dict"]
-    else:
-        # випадок, коли збережено чистий state_dict без обгортки
-        state_dict = state
-
-    model.load_state_dict(state_dict)
-    model.eval()
-
-
+    # 5. Прогноз у скейленому просторі
     with torch.no_grad():
-        y_scaled = model(x.to(device)).cpu().numpy().reshape(-1)[-1]
+        y_scaled = model(x).cpu().numpy().reshape(-1)[-1]
 
-    # 5. inverse-scale тільки таргет
+    # 6. inverse-scale тільки таргет назад у USD
     y_pred = float(
         _inverse_scale_target(
             scaler,
@@ -177,7 +163,7 @@ def forecast_next_t1_and_store(
         )[0]
     )
 
-    # 6. Запис у DuckDB
+    # 7. Запис у DuckDB
     store_hourly_forecast(
         coin_id=coin_id,
         vs_currency=vs_currency,
